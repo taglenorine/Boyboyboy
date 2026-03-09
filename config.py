@@ -8,6 +8,7 @@ real .env file to change values.
 
 import os
 from dotenv import load_dotenv
+from core.models import PAID_ONLY_MODEL_IDS
 
 load_dotenv()
 
@@ -38,9 +39,12 @@ FREE_DAILY_GRANT: int = 10
 POLLEN_COST_TEXT: float = 0.01       # per request
 POLLEN_COST_IMAGE: float = 0.05      # per image
 POLLEN_COST_VIDEO: float = 0.05      # per second of video
+POLLEN_COST_AUDIO: float = 0.01      # per audio request (TTS/STT)
 
-# Models that are ONLY available to premium / BYOP users
-PAID_ONLY_MODELS: set = {"veo", "gpt-4o", "claude-large"}
+# Models that are ONLY available to premium / BYOP users.
+# Derived from the comprehensive model catalog (core/models.py) so that
+# this set always stays in sync with the catalog.
+PAID_ONLY_MODELS: set = PAID_ONLY_MODEL_IDS
 
 # ── Context window ────────────────────────────────────────────────────────────
 # Number of past messages kept in short-term memory per user
