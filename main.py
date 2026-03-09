@@ -23,6 +23,7 @@ from telegram.ext import (
 from config import TELEGRAM_BOT_TOKEN
 from core.pollinations import run_agent
 from database import crud
+from config import ADMIN_USER_IDS
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
@@ -61,13 +62,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• */help* – Panduan ini\n"
         "• */login* – Daftarkan BYOP API Key kamu\n"
         "• */balance* – Cek saldo Pollen kamu\n"
+        "• */history* – Lihat riwayat percakapan terakhir\n"
         "• */reset* – Hapus riwayat percakapan\n\n"
         "*Kapabilitas otomatis:*\n"
         "• 🖼 Buat gambar\n"
         "• 💬 Jawab pertanyaan & coding\n"
         "• 👁 Analisis foto yang lo kirim\n"
         "• 🎬 Buat video (Premium / BYOP)\n"
-        "• 🔊 Text-to-Speech\n",
+        "• 🔊 Text-to-Speech\n"
+        "• 🎙 Transkrip pesan suara\n",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -124,6 +127,82 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /history – show recent conversation context."""
+    user = update.effective_user
+    history = crud.load_context(user.id)
+
+    if not history:
+        await update.message.reply_text(
+            "📭 Belum ada riwayat percakapan.\n\nMulai ngobrol dulu, Bos! 💬",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = ["*🗂 Riwayat Percakapan Terakhir:*\n"]
+    for i, msg in enumerate(history[-10:], 1):
+        role_label = "👤 *Kamu*" if msg.get("role") == "user" else "🤖 *BalapBoY*"
+        content = msg.get("content", "")
+        # Handle multimodal content (list): extract the first text part
+        if isinstance(content, list):
+            text_part = ""
+            for part in content:
+                if part.get("type") == "text":
+                    text_part = part.get("text", "")
+                    break
+            content = text_part or "[media]"
+        snippet = str(content)[:200].replace("_", "\\_").replace("*", "\\*")
+        lines.append(f"{i}. {role_label}:\n_{snippet}_\n")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /topup <user_id> <amount> – admin-only Pollen top-up."""
+    admin = update.effective_user
+
+    if admin.id not in ADMIN_USER_IDS:
+        await update.message.reply_text(
+            "⛔ Perintah ini hanya tersedia untuk admin.",
+        )
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "ℹ️ *Penggunaan:* `/topup <user_id> <jumlah>`\n\n"
+            "Contoh: `/topup 123456789 10.0`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+        amount = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Format salah. Gunakan: `/topup <user_id> <jumlah>`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if amount <= 0:
+        await update.message.reply_text("⚠️ Jumlah harus lebih dari 0.")
+        return
+
+    crud.add_pollen(target_id, amount)
+    new_balance = crud.get_pollen_balance(target_id)
+    await update.message.reply_text(
+        f"✅ *Top-up berhasil!*\n\n"
+        f"👤 User ID: `{target_id}`\n"
+        f"➕ Ditambahkan: `{amount:.4f}` Pollen\n"
+        f"🌸 Saldo baru: `{new_balance:.4f}` Pollen",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # ── Message handlers ──────────────────────────────────────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -161,6 +240,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         user_message=caption,
         username=user.username or "",
         image_bytes=bytes(image_bytes),
+    )
+
+    await _send_agent_response(update, response)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice messages – transcribe via STT then route to agentic core."""
+    user = update.effective_user
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
+
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    audio_bytes = await file.download_as_bytearray()
+
+    caption = update.message.caption or ""
+
+    response = await run_agent(
+        user_id=user.id,
+        user_message=caption,
+        username=user.username or "",
+        audio_bytes=bytes(audio_bytes),
     )
 
     await _send_agent_response(update, response)
@@ -234,12 +336,15 @@ def main() -> None:
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("login", cmd_login))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("topup", cmd_topup))
 
     # Messages
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Error handler
     app.add_error_handler(error_handler)

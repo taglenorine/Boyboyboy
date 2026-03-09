@@ -45,3 +45,16 @@ PAID_ONLY_MODELS: set = {"veo", "gpt-4o", "claude-large"}
 # ── Context window ────────────────────────────────────────────────────────────
 # Number of past messages kept in short-term memory per user
 CONTEXT_WINDOW: int = 5
+
+# ── Audio (TTS / STT) ─────────────────────────────────────────────────────────
+POLLINATIONS_AUDIO_URL: str = os.environ.get(
+    "POLLINATIONS_AUDIO_URL", "https://audio.pollinations.ai"
+)
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
+# Comma-separated list of Telegram user IDs that may run admin commands
+ADMIN_USER_IDS: set = {
+    int(x)
+    for x in os.environ.get("ADMIN_USER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
