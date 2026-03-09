@@ -42,6 +42,7 @@ from config import (
     CONTEXT_WINDOW,
     DEFAULT_IMAGE_MODEL,
     DEFAULT_TEXT_MODEL,
+    POLLINATIONS_AUDIO_URL,
     POLLINATIONS_IMAGE_URL,
     POLLINATIONS_TEXT_URL,
 )
@@ -192,6 +193,49 @@ async def _fetch_image(prompt: str, model: str, byop_key: str = "") -> bytes:
         return resp.content
 
 
+async def _fetch_tts(text: str, voice: str = "alloy", byop_key: str = "") -> bytes:
+    """Download TTS audio (MP3) from the Pollinations audio API."""
+    # Trim to 500 characters to stay within safe URL length limits before encoding
+    encoded = urllib.parse.quote(text[:500])
+    url = f"{POLLINATIONS_AUDIO_URL}/{encoded}?model=openai-audio&voice={voice}"
+    headers = {}
+    if byop_key:
+        headers["Authorization"] = f"Bearer {byop_key}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(url, headers=headers, follow_redirects=True)
+        resp.raise_for_status()
+        return resp.content
+
+
+async def _transcribe_audio(audio_bytes: bytes, byop_key: str = "") -> str:
+    """
+    Transcribe audio bytes to text using the Pollinations text API.
+
+    The audio is sent as a base64-encoded ``input_audio`` part in a multimodal
+    user message.  Falls back to an error string on failure.
+    """
+    b64 = base64.b64encode(audio_bytes).decode()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Tolong transkripsikan file audio berikut menjadi teks. "
+                        "Kembalikan hanya teks transkripsi, tanpa komentar tambahan."
+                    ),
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": b64, "format": "ogg"},
+                },
+            ],
+        }
+    ]
+    return await _call_text_api(messages, "openai-audio", byop_key)
+
+
 async def _call_text_api(
     messages: list[dict],
     model: str,
@@ -278,14 +322,68 @@ async def _execute_tool(
         ok, reason = check_and_charge(user_id, ACTION_TTS)
         if not ok:
             return reason, None
-        # TTS would call the tts-1 endpoint; stub for now
-        return "[Audio TTS is not yet implemented in this version]", None
+
+        text_to_speak = params.get("text", "")
+        if not text_to_speak:
+            return "[TTS error: no text provided]", None
+
+        voice = params.get("voice", "alloy")
+        try:
+            audio_bytes = await _fetch_tts(text_to_speak, voice, byop_key)
+            media = MediaResult(kind="audio", data=audio_bytes, caption="")
+            return "[Audio generated successfully]", media
+        except httpx.HTTPStatusError as exc:
+            logger.error("TTS failed: %s", exc)
+            return f"[TTS failed: {exc.response.status_code}]", None
 
     if tool == ACTION_STT:
         ok, reason = check_and_charge(user_id, ACTION_STT)
         if not ok:
             return reason, None
-        return "[Audio STT is not yet implemented in this version]", None
+
+        # STT is handled upstream via run_agent(audio_bytes=…); if called as an
+        # explicit tool directive there is nothing to transcribe here.
+        return "[Audio STT: kirim pesan suara langsung ke bot untuk transkripsi otomatis]", None
+
+    if tool == ACTION_VISION:
+        image_url = params.get("url", "")
+        prompt = params.get("prompt", "Analisis gambar ini.")
+        model = params.get("model", DEFAULT_TEXT_MODEL)
+
+        ok, reason = check_and_charge(user_id, ACTION_VISION, model)
+        if not ok:
+            return reason, None
+
+        if not image_url:
+            return "[Vision error: no image URL provided]", None
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                img_resp = await client.get(image_url, follow_redirects=True)
+                img_resp.raise_for_status()
+                img_b64 = base64.b64encode(img_resp.content).decode()
+        except Exception as exc:
+            logger.error("Vision image download failed: %s", exc)
+            return f"[Vision error: could not download image – {exc}]", None
+
+        try:
+            vision_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                        },
+                    ],
+                }
+            ]
+            analysis = await _call_text_api(vision_messages, model, byop_key)
+            return analysis, None
+        except httpx.HTTPStatusError as exc:
+            logger.error("Vision analysis failed: %s", exc)
+            return f"[Vision analysis failed: {exc.response.status_code}]", None
 
     return f"[Unknown tool: {tool}]", None
 
@@ -297,6 +395,7 @@ async def run_agent(
     user_message: str,
     username: str = "",
     image_bytes: Optional[bytes] = None,
+    audio_bytes: Optional[bytes] = None,
 ) -> AgentResponse:
     """
     Run the full agentic loop for one user turn.
@@ -307,12 +406,30 @@ async def run_agent(
     4.  Intercept any [CALL_TOOL: …] directives, execute them, and feed
         observations back.
     5.  Return the cleaned final answer plus any generated media.
+
+    Parameters
+    ──────────
+    audio_bytes : Optional raw audio bytes from a Telegram voice message.
+                  When provided the audio is first transcribed via STT and the
+                  resulting text is used as the effective user message.
     """
     # Ensure the user exists in the database
     crud.get_user(user_id, username)
 
     # Resolve BYOP key once
     byop_key = crud.get_user_byop_key(user_id) or ""
+
+    # ── STT: transcribe voice message before entering the agentic loop ────────
+    if audio_bytes:
+        ok, reason = check_and_charge(user_id, ACTION_STT)
+        if not ok:
+            return AgentResponse(text=reason, error=False)
+        try:
+            transcribed = await _transcribe_audio(audio_bytes, byop_key)
+            user_message = transcribed or user_message
+        except Exception as exc:
+            logger.error("STT transcription failed: %s", exc)
+            # Continue with whatever caption/text was provided
 
     # Load short-term memory
     history: list[dict] = crud.load_context(user_id)
